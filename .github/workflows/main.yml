@@ -1,4 +1,4 @@
-name: VNC
+name: VNC1
 
 on:
   workflow_dispatch:
@@ -21,25 +21,45 @@ jobs:
           # Wait for VNC service to be installed
           Start-Sleep -Seconds 10
 
-      - name: Configure VNC Server
+      - name: Configure VNC Server Properly
         run: |
-          # Set VNC password (using password from GitHub Secrets)
+          # Use TightVNC's built-in utility to set the password properly
           $vncPassword = "${{ secrets.VNC1_FIXED_PASSWORD }}"
           
-          # TightVNC stores configuration in registry
-          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
+          # First stop the service if it's running
+          Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
           
-          # Ensure registry path exists
-          if (-not (Test-Path $vncRegPath)) {
-              New-Item -Path $vncRegPath -Force
+          # Use TightVNC's password utility to set the password properly
+          $vncServerPath = "${env:ProgramFiles}\TightVNC"
+          $vncPwdUtil = "$vncServerPath\vncpwd.exe"
+          
+          if (Test-Path $vncPwdUtil) {
+              # Create a temporary file with the password
+              $tempFile = "$env:TEMP\vncpasswd.txt"
+              $vncPassword | Out-File -FilePath $tempFile -Encoding ASCII
+              
+              # Set the password using the utility
+              Start-Process -FilePath $vncPwdUtil -ArgumentList "-o", "-f", "-p", $tempFile -Wait
+              Remove-Item $tempFile -Force
+              
+              Write-Host "VNC password set successfully using vncpwd utility"
+          } else {
+              Write-Warning "vncpwd.exe not found, trying manual registry configuration"
+              
+              # Manual registry configuration (less reliable)
+              $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
+              if (-not (Test-Path $vncRegPath)) {
+                  New-Item -Path $vncRegPath -Force
+              }
+              
+              # For a simple password like "password", this might work
+              # But it's better to use the utility
+              Set-ItemProperty -Path $vncRegPath -Name "Password" -Value "83 8B 27 33 63 0E 0D 2B" -Force
+              Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value "" -Force
           }
           
-          # Set VNC password (TightVNC uses encrypted format, but we'll set it directly)
-          # Note: In production, you might want to use TightVNC's vncpwd utility to properly encrypt
-          Set-ItemProperty -Path $vncRegPath -Name "Password" -Value $vncPassword -Force
-          Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value "" -Force
-          
-          # Configure VNC settings
+          # Configure other VNC settings
+          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
           Set-ItemProperty -Path $vncRegPath -Name "RfbPort" -Value 5900 -Force
           Set-ItemProperty -Path $vncRegPath -Name "HttpPort" -Value 5800 -Force
           Set-ItemProperty -Path $vncRegPath -Name "AcceptRfbConnections" -Value 1 -Force
@@ -47,30 +67,30 @@ jobs:
           Set-ItemProperty -Path $vncRegPath -Name "QueryOnlyIfLoggedOn" -Value 0 -Force
           
           # Configure firewall for VNC
-          netsh advfirewall firewall delete rule name="VNC-Tailscale"
+          netsh advfirewall firewall delete rule name="VNC-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="VNC-Tailscale" `
             dir=in action=allow protocol=TCP localport=5900
           netsh advfirewall firewall add rule name="VNC-HTTP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=5800
+            dir=in action=allow protocol=TCP localport=5800 -ErrorAction SilentlyContinue
 
-      - name: Create VNC User with Fixed Password
+      - name: Create VNC1 User with Fixed Password
         run: |
-          $fixedPassword = "${{ secrets.VNC_FIXED_PASSWORD }}"
+          $fixedPassword = "${{ secrets.VNC1_FIXED_PASSWORD }}"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
-          $userExists = Get-LocalUser -Name "VNC" -ErrorAction SilentlyContinue
+          $userExists = Get-LocalUser -Name "VNC1" -ErrorAction SilentlyContinue
           if ($userExists) {
-              Set-LocalUser -Name "VNC" -Password $securePass
-              Write-Host "Updated existing VNC user password"
+              Set-LocalUser -Name "VNC1" -Password $securePass
+              Write-Host "Updated existing VNC1 user password"
           } else {
-              New-LocalUser -Name "VNC" -Password $securePass -AccountNeverExpires
-              Write-Host "Created new VNC user"
+              New-LocalUser -Name "VNC1" -Password $securePass -AccountNeverExpires
+              Write-Host "Created new VNC1 user"
           }
           
-          Add-LocalGroupMember -Group "Administrators" -Member "VNC" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "VNC1" -ErrorAction SilentlyContinue
           
-          echo "VNC_USER=VNC" >> $env:GITHUB_ENV
-          echo "VNC_PASSWORD=$fixedPassword" >> $env:GITHUB_ENV
+          echo "VNC1_USER=VNC1" >> $env:GITHUB_ENV
+          echo "VNC1_PASSWORD=$fixedPassword" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -83,7 +103,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-vnc-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY1 }} --hostname=gh-vnc-runner-$env:GITHUB_RUN_ID
           
           $tsIP = $null
           $retries = 0
@@ -99,21 +119,37 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Start VNC Server Service
+      - name: Start VNC Server Service and Verify
         run: |
-          # Start the TightVNC server service
-          Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          # Stop service first to ensure clean start
+          Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
           
-          # Wait a moment for the service to start
+          # Start the TightVNC server service
+          Start-Service -Name "tvnserver"
+          
+          # Wait for the service to start properly
           Start-Sleep -Seconds 5
           
           # Verify service is running
-          $serviceStatus = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          $serviceStatus = Get-Service -Name "tvnserver"
           if ($serviceStatus.Status -ne "Running") {
-              Write-Error "VNC service failed to start"
+              Write-Error "VNC service failed to start. Current status: $($serviceStatus.Status)"
+              # Try to get more details
+              Get-EventLog -LogName Application -Source "tvnserver" -Newest 5 -ErrorAction SilentlyContinue | Format-List
               exit 1
           }
+          
           Write-Host "VNC service started successfully"
+          
+          # Check if VNC is listening on port 5900
+          $listening = netstat -an | Select-String ":5900 " | Select-String "LISTENING"
+          if (-not $listening) {
+              Write-Warning "VNC not listening on port 5900. Checking all ports..."
+              netstat -an | Select-String "LISTENING" | Where-Object { $_ -like "*59*" }
+          } else {
+              Write-Host "VNC is listening on port 5900"
+          }
 
       - name: Verify VNC Accessibility
         run: |
@@ -127,15 +163,19 @@ jobs:
           }
           Write-Host "VNC connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Maintain Connection with Troubleshooting Info
         run: |
           Write-Host "`n=== VNC ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP:5900"
-          Write-Host "Username: VNC"
+          Write-Host "Username: VNC1"
           Write-Host "Password: **********"
           Write-Host "==================`n"
-          Write-Host "Note: Use any VNC client to connect to the above address"
-          Write-Host "Recommended clients: TightVNC, RealVNC, TigerVNC, or built-in macOS Screen Sharing"
+          
+          # Display troubleshooting information
+          Write-Host "Troubleshooting Info:"
+          Write-Host "VNC Service Status: $(Get-Service -Name 'tvnserver' | Select-Object -ExpandProperty Status)"
+          Write-Host "Port 5900 listening: $(netstat -an | Select-String ':5900 ' | Select-String 'LISTENING' | Measure-Object | Select-Object -ExpandProperty Count)"
+          Write-Host "Tailscale status: $( & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty BackendState )"
           
           while ($true) {
               Write-Host "[$(Get-Date)] VNC Active - Use Ctrl+C in workflow to terminate"
