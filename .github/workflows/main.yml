@@ -66,12 +66,12 @@ jobs:
           Set-ItemProperty -Path $vncRegPath -Name "QueryConnect" -Value 0 -Force
           Set-ItemProperty -Path $vncRegPath -Name "QueryOnlyIfLoggedOn" -Value 0 -Force
           
-          # Configure firewall for VNC
-          netsh advfirewall firewall delete rule name="VNC-Tailscale" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="VNC-Tailscale" `
-            dir=in action=allow protocol=TCP localport=5900
-          netsh advfirewall firewall add rule name="VNC-HTTP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=5800 -ErrorAction SilentlyContinue
+          # Configure firewall for VNC - FIXED with proper protocol parameter
+          netsh advfirewall firewall delete rule name="VNC-Tailscale" protocol=TCP localport=5900 -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="VNC-Tailscale" dir=in action=allow protocol=TCP localport=5900
+          
+          netsh advfirewall firewall delete rule name="VNC-HTTP-Tailscale" protocol=TCP localport=5800 -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="VNC-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=5800
 
       - name: Create VNC1 User with Fixed Password
         run: |
