@@ -27,7 +27,7 @@ jobs:
           $vncPassword = "password"  # Your desired password
           
           # Create or update the INI file
-          @"
+          $iniContent = @"
 [admin]
 passwd=$vncPassword
 passwd2=
@@ -35,11 +35,13 @@ passwd2=
 passwd=$vncPassword
 passwd2=
 port=5900
-"@ | Out-File -FilePath $vncIniPath -Encoding ASCII -Force
+"@
+          $iniContent | Out-File -FilePath $vncIniPath -Encoding ASCII -Force
           
           # Configure firewall
           netsh advfirewall firewall delete rule name="VNC-Tailscale" protocol=TCP localport=5900 -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="VNC-Tailscale" dir=in action=allow protocol=TCP localport=5900
+
       - name: Disable Password Complexity Requirements
         run: |
           # Temporarily disable password complexity requirements
@@ -47,6 +49,7 @@ port=5900
           (Get-Content $env:TEMP\secpol.cfg) -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Set-Content $env:TEMP\secpol.cfg
           secedit /configure /db $env:TEMP\secpol.sdb /cfg $env:TEMP\secpol.cfg
           Remove-Item $env:TEMP\secpol.cfg, $env:TEMP\secpol.sdb -Force -ErrorAction SilentlyContinue
+
       - name: Create User with Same Password
         run: |
           $fixedPassword = "password"
