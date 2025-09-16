@@ -9,46 +9,37 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Download and Install TightVNC
+      - name: Download and Install UltraVNC
         run: |
-          $vncUrl = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
-          $installerPath = "$env:TEMP\tightvnc.msi"
+          $vncUrl = "https://www.uvnc.com/downloads/ultravnc/1.4.3.2/UltraVNC_1_4_3_2_X64_Setup.exe"
+          $installerPath = "$env:TEMP\ultravnc.exe"
           
           Invoke-WebRequest -Uri $vncUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "ADDLOCAL=Server" -Wait
+          # Silent install with server component only
+          Start-Process -FilePath $installerPath -ArgumentList "/verysilent", "/norestart", "/components=server" -Wait
           Remove-Item $installerPath -Force
           Start-Sleep -Seconds 10
 
-      - name: Configure VNC with Complex Password
+      - name: Configure UltraVNC with Plain Text Password
         run: |
-          # Stop service first
-          Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
+          # UltraVNC stores password in plain text in ultravnc.ini
+          $vncIniPath = "${env:ProgramFiles}\uvnc bvba\UltraVNC\ultravnc.ini"
+          $vncPassword = "password"  # Your desired password
           
-          # Use a complex password that meets Windows requirements
-          $complexPassword = "VncPassword123!"  # Meets complexity requirements
-          
-          # Configure VNC registry settings with pre-encrypted password
-          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
-          if (-not (Test-Path $vncRegPath)) {
-              New-Item -Path $vncRegPath -Force
-          }
-          
-          # Pre-encrypted registry values for password "VncPassword123!"
-          # This is the encrypted format for the complex password
-          Set-ItemProperty -Path $vncRegPath -Name "Password" -Value ([byte[]](0xE3, 0x1A, 0x72, 0x2D, 0x2B, 0xDD, 0xBD, 0x4F)) -Force
-          Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value ([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)) -Force
-          Set-ItemProperty -Path $vncRegPath -Name "RfbPort" -Value 5900 -Force
-          Set-ItemProperty -Path $vncRegPath -Name "HttpPort" -Value 5800 -Force
-          Set-ItemProperty -Path $vncRegPath -Name "AcceptRfbConnections" -Value 1 -Force
-          Set-ItemProperty -Path $vncRegPath -Name "QueryConnect" -Value 0 -Force
-          Set-ItemProperty -Path $vncRegPath -Name "QueryOnlyIfLoggedOn" -Value 0 -Force
+          # Create or update the INI file
+          @"
+[admin]
+passwd=$vncPassword
+passwd2=
+[ultravnc]
+passwd=$vncPassword
+passwd2=
+port=5900
+"@ | Out-File -FilePath $vncIniPath -Encoding ASCII -Force
           
           # Configure firewall
           netsh advfirewall firewall delete rule name="VNC-Tailscale" protocol=TCP localport=5900 -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="VNC-Tailscale" dir=in action=allow protocol=TCP localport=5900
-          
-          # Store the password for user creation
-          echo "VNC_PASSWORD=VncPassword123!" >> $env:GITHUB_ENV
       - name: Disable Password Complexity Requirements
         run: |
           # Temporarily disable password complexity requirements
@@ -56,26 +47,21 @@ jobs:
           (Get-Content $env:TEMP\secpol.cfg) -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Set-Content $env:TEMP\secpol.cfg
           secedit /configure /db $env:TEMP\secpol.sdb /cfg $env:TEMP\secpol.cfg
           Remove-Item $env:TEMP\secpol.cfg, $env:TEMP\secpol.sdb -Force -ErrorAction SilentlyContinue
-      - name: Create User with Complex Password
+      - name: Create User with Same Password
         run: |
-          # Use the complex password that meets Windows requirements
-          $fixedPassword = "VncPassword123!"
+          $fixedPassword = "password"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
           $userExists = Get-LocalUser -Name "VNC1" -ErrorAction SilentlyContinue
           if ($userExists) {
               Set-LocalUser -Name "VNC1" -Password $securePass
-              Write-Host "Updated existing VNC1 user password"
           } else {
               New-LocalUser -Name "VNC1" -Password $securePass -AccountNeverExpires
-              Write-Host "Created new VNC1 user"
           }
           
           Add-LocalGroupMember -Group "Administrators" -Member "VNC1" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "VNC1" -ErrorAction SilentlyContinue
-          
           echo "VNC1_USER=VNC1" >> $env:GITHUB_ENV
-          echo "VNC1_PASSWORD=VncPassword123!" >> $env:GITHUB_ENV
+          echo "VNC1_PASSWORD=password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -97,29 +83,19 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Start VNC Service
+      - name: Start UltraVNC Service
         run: |
-          Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 2
-          Start-Service -Name "tvnserver"
+          # UltraVNC service name might be different
+          Start-Service -Name "uvnc_service" -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
-          
-          # Verify service is running
-          $serviceStatus = Get-Service -Name "tvnserver"
-          if ($serviceStatus.Status -ne "Running") {
-              Write-Error "VNC service failed to start"
-              exit 1
-          }
 
       - name: Maintain Connection
         run: |
           Write-Host "`n=== VNC ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP:5900"
           Write-Host "Username: VNC1"
-          Write-Host "Password: VncPassword123!"  # Complex password that meets requirements
+          Write-Host "Password: password"
           Write-Host "==================`n"
-          Write-Host "Note: This password meets Windows complexity requirements"
-          Write-Host "      (uppercase, lowercase, number, special character)"
           
           while ($true) {
               Write-Host "[$(Get-Date)] VNC Active - Use Ctrl+C to terminate"
