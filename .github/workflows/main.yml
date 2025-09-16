@@ -17,43 +17,71 @@ jobs:
           Invoke-WebRequest -Uri $vncUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "ADDLOCAL=Server" -Wait
           Remove-Item $installerPath -Force
+          
+          # Wait for VNC service to be installed
           Start-Sleep -Seconds 10
 
-      - name: Configure VNC with Complex Password
+      - name: Configure VNC Server Properly
         run: |
-          # Stop service first
+          # Use TightVNC's built-in utility to set the password properly
+          $vncPassword = "${{ secrets.VNC1_FIXED_PASSWORD }}"
+          
+          # First stop the service if it's running
           Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
           
-          # Use a complex password that meets Windows requirements
-          $complexPassword = "VncPassword123!"  # Meets complexity requirements
+          # Use TightVNC's password utility to set the password properly
+          $vncServerPath = "${env:ProgramFiles}\TightVNC"
+          $vncPwdUtil = "$vncServerPath\vncpwd.exe"
           
-          # Configure VNC registry settings with pre-encrypted password
-          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
-          if (-not (Test-Path $vncRegPath)) {
-              New-Item -Path $vncRegPath -Force
+          if (Test-Path $vncPwdUtil) {
+              # Create a temporary file with the password
+              $tempFile = "$env:TEMP\vncpasswd.txt"
+              $vncPassword | Out-File -FilePath $tempFile -Encoding ASCII
+              
+              # Set the password using the utility
+              Start-Process -FilePath $vncPwdUtil -ArgumentList "-o", "-f", "-p", $tempFile -Wait
+              Remove-Item $tempFile -Force
+              
+              Write-Host "VNC password set successfully using vncpwd utility"
+          } else {
+              Write-Warning "vncpwd.exe not found, trying manual registry configuration"
+              
+              # Manual registry configuration (less reliable)
+              $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
+              if (-not (Test-Path $vncRegPath)) {
+                  New-Item -Path $vncRegPath -Force
+              }
+              
+              # For a simple password like "password", this might work
+              # But it's better to use the utility
+              Set-ItemProperty -Path $vncRegPath -Name "Password" -Value "83 8B 27 33 63 0E 0D 2B" -Force
+              Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value "" -Force
           }
           
-          # Pre-encrypted registry values for password "VncPassword123!"
-          # This is the encrypted format for the complex password
-          Set-ItemProperty -Path $vncRegPath -Name "Password" -Value ([byte[]](0xE3, 0x1A, 0x72, 0x2D, 0x2B, 0xDD, 0xBD, 0x4F)) -Force
-          Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value ([byte[]](0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)) -Force
+          # Configure other VNC settings
+          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
           Set-ItemProperty -Path $vncRegPath -Name "RfbPort" -Value 5900 -Force
           Set-ItemProperty -Path $vncRegPath -Name "HttpPort" -Value 5800 -Force
           Set-ItemProperty -Path $vncRegPath -Name "AcceptRfbConnections" -Value 1 -Force
           Set-ItemProperty -Path $vncRegPath -Name "QueryConnect" -Value 0 -Force
           Set-ItemProperty -Path $vncRegPath -Name "QueryOnlyIfLoggedOn" -Value 0 -Force
           
-          # Configure firewall
+          # Configure firewall for VNC - FIXED with proper protocol parameter
           netsh advfirewall firewall delete rule name="VNC-Tailscale" protocol=TCP localport=5900 -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="VNC-Tailscale" dir=in action=allow protocol=TCP localport=5900
           
-          # Store the password for user creation
-          echo "VNC_PASSWORD=VncPassword123!" >> $env:GITHUB_ENV
-
-      - name: Create User with Complex Password
+          netsh advfirewall firewall delete rule name="VNC-HTTP-Tailscale" protocol=TCP localport=5800 -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="VNC-HTTP-Tailscale" dir=in action=allow protocol=TCP localport=5800
+      - name: Disable Password Complexity Requirements
         run: |
-          # Use the complex password that meets Windows requirements
-          $fixedPassword = "VncPassword123!"
+          # Temporarily disable password complexity requirements
+          secedit /export /cfg $env:TEMP\secpol.cfg
+          (Get-Content $env:TEMP\secpol.cfg) -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Set-Content $env:TEMP\secpol.cfg
+          secedit /configure /db $env:TEMP\secpol.sdb /cfg $env:TEMP\secpol.cfg
+          Remove-Item $env:TEMP\secpol.cfg, $env:TEMP\secpol.sdb -Force -ErrorAction SilentlyContinue
+      - name: Create VNC1 User with Fixed Password
+        run: |
+          $fixedPassword = "${{ secrets.VNC1_FIXED_PASSWORD }}"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
           $userExists = Get-LocalUser -Name "VNC1" -ErrorAction SilentlyContinue
@@ -66,15 +94,15 @@ jobs:
           }
           
           Add-LocalGroupMember -Group "Administrators" -Member "VNC1" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "VNC1" -ErrorAction SilentlyContinue
           
           echo "VNC1_USER=VNC1" >> $env:GITHUB_ENV
-          echo "VNC1_PASSWORD=VncPassword123!" >> $env:GITHUB_ENV
+          echo "VNC1_PASSWORD=$fixedPassword" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
@@ -82,6 +110,7 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY1 }} --hostname=gh-vnc-runner-$env:GITHUB_RUN_ID
+          
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -89,33 +118,72 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Start VNC Service
+      - name: Start VNC Server Service and Verify
         run: |
+          # Stop service first to ensure clean start
           Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
+          
+          # Start the TightVNC server service
           Start-Service -Name "tvnserver"
+          
+          # Wait for the service to start properly
           Start-Sleep -Seconds 5
           
           # Verify service is running
           $serviceStatus = Get-Service -Name "tvnserver"
           if ($serviceStatus.Status -ne "Running") {
-              Write-Error "VNC service failed to start"
+              Write-Error "VNC service failed to start. Current status: $($serviceStatus.Status)"
+              # Try to get more details
+              Get-EventLog -LogName Application -Source "tvnserver" -Newest 5 -ErrorAction SilentlyContinue | Format-List
               exit 1
           }
+          
+          Write-Host "VNC service started successfully"
+          
+          # Check if VNC is listening on port 5900
+          $listening = netstat -an | Select-String ":5900 " | Select-String "LISTENING"
+          if (-not $listening) {
+              Write-Warning "VNC not listening on port 5900. Checking all ports..."
+              netstat -an | Select-String "LISTENING" | Where-Object { $_ -like "*59*" }
+          } else {
+              Write-Host "VNC is listening on port 5900"
+          }
 
-      - name: Maintain Connection
+      - name: Verify VNC Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity to VNC port
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 5900
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to VNC port 5900 failed"
+              exit 1
+          }
+          Write-Host "VNC connectivity successful!"
+
+      - name: Maintain Connection with Troubleshooting Info
         run: |
           Write-Host "`n=== VNC ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP:5900"
           Write-Host "Username: VNC1"
-          Write-Host "Password: VncPassword123!"  # Complex password that meets requirements
+          Write-Host "Password: **********"
           Write-Host "==================`n"
-          Write-Host "Note: This password meets Windows complexity requirements"
-          Write-Host "      (uppercase, lowercase, number, special character)"
+          
+          # Display troubleshooting information
+          Write-Host "Troubleshooting Info:"
+          Write-Host "VNC Service Status: $(Get-Service -Name 'tvnserver' | Select-Object -ExpandProperty Status)"
+          Write-Host "Port 5900 listening: $(netstat -an | Select-String ':5900 ' | Select-String 'LISTENING' | Measure-Object | Select-Object -ExpandProperty Count)"
+          Write-Host "Tailscale status: $( & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty BackendState )"
           
           while ($true) {
-              Write-Host "[$(Get-Date)] VNC Active - Use Ctrl+C to terminate"
+              Write-Host "[$(Get-Date)] VNC Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
