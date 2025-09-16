@@ -1,61 +1,76 @@
-name: RDP
+name: VNC
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  secure-vnc:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Download and Install TightVNC
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          $vncUrl = "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi"
+          $installerPath = "$env:TEMP\tightvnc.msi"
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          Invoke-WebRequest -Uri $vncUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "ADDLOCAL=Server" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Wait for VNC service to be installed
+          Start-Sleep -Seconds 10
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: Configure VNC Server
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          # Set VNC password (using password from GitHub Secrets)
+          $vncPassword = "${{ secrets.VNC1_FIXED_PASSWORD }}"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          # TightVNC stores configuration in registry
+          $vncRegPath = "HKLM:\SOFTWARE\TightVNC\Server"
           
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          # Ensure registry path exists
+          if (-not (Test-Path $vncRegPath)) {
+              New-Item -Path $vncRegPath -Force
           }
+          
+          # Set VNC password (TightVNC uses encrypted format, but we'll set it directly)
+          # Note: In production, you might want to use TightVNC's vncpwd utility to properly encrypt
+          Set-ItemProperty -Path $vncRegPath -Name "Password" -Value $vncPassword -Force
+          Set-ItemProperty -Path $vncRegPath -Name "PasswordViewOnly" -Value "" -Force
+          
+          # Configure VNC settings
+          Set-ItemProperty -Path $vncRegPath -Name "RfbPort" -Value 5900 -Force
+          Set-ItemProperty -Path $vncRegPath -Name "HttpPort" -Value 5800 -Force
+          Set-ItemProperty -Path $vncRegPath -Name "AcceptRfbConnections" -Value 1 -Force
+          Set-ItemProperty -Path $vncRegPath -Name "QueryConnect" -Value 0 -Force
+          Set-ItemProperty -Path $vncRegPath -Name "QueryOnlyIfLoggedOn" -Value 0 -Force
+          
+          # Configure firewall for VNC
+          netsh advfirewall firewall delete rule name="VNC-Tailscale"
+          netsh advfirewall firewall add rule name="VNC-Tailscale" `
+            dir=in action=allow protocol=TCP localport=5900
+          netsh advfirewall firewall add rule name="VNC-HTTP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=5800
+
+      - name: Create VNC User with Fixed Password
+        run: |
+          $fixedPassword = "${{ secrets.VNC_FIXED_PASSWORD }}"
+          $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
+          
+          $userExists = Get-LocalUser -Name "VNC" -ErrorAction SilentlyContinue
+          if ($userExists) {
+              Set-LocalUser -Name "VNC" -Password $securePass
+              Write-Host "Updated existing VNC user password"
+          } else {
+              New-LocalUser -Name "VNC" -Password $securePass -AccountNeverExpires
+              Write-Host "Created new VNC user"
+          }
+          
+          Add-LocalGroupMember -Group "Administrators" -Member "VNC" -ErrorAction SilentlyContinue
+          
+          echo "VNC_USER=VNC" >> $env:GITHUB_ENV
+          echo "VNC_PASSWORD=$fixedPassword" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -68,10 +83,8 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-vnc-runner-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -85,29 +98,46 @@ jobs:
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
+
+      - name: Start VNC Server Service
+        run: |
+          # Start the TightVNC server service
+          Start-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          
+          # Wait a moment for the service to start
+          Start-Sleep -Seconds 5
+          
+          # Verify service is running
+          $serviceStatus = Get-Service -Name "tvnserver" -ErrorAction SilentlyContinue
+          if ($serviceStatus.Status -ne "Running") {
+              Write-Error "VNC service failed to start"
+              exit 1
+          }
+          Write-Host "VNC service started successfully"
+
+      - name: Verify VNC Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          # Test connectivity to VNC port
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 5900
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+              Write-Error "TCP connection to VNC port 5900 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "VNC connectivity successful!"
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "`n=== VNC ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP:5900"
+          Write-Host "Username: VNC"
+          Write-Host "Password: **********"
           Write-Host "==================`n"
+          Write-Host "Note: Use any VNC client to connect to the above address"
+          Write-Host "Recommended clients: TightVNC, RealVNC, TigerVNC, or built-in macOS Screen Sharing"
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] VNC Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
